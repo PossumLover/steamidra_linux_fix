@@ -121,10 +121,10 @@ jobs:
           set -euo pipefail
           QT_LIB="$(ls -d "${PWD}"/.ci/qt/*/gcc_64/lib)"
           mkdir -p qt-runtime
-          for f in libQt6Core.so.6 libQt6Network.so.6; do
+          for f in libQt6Core.so.6 libQt6Network.so.6 libQt6Concurrent.so.6; do
             cp -aL "${QT_LIB}/${f}" qt-runtime/
           done
-          for f in libQt6Core.so.6 libQt6Network.so.6; do
+          for f in libQt6Core.so.6 libQt6Network.so.6 libQt6Concurrent.so.6; do
             LD_LIBRARY_PATH="${QT_LIB}" ldd "qt-runtime/${f}" \
               | awk -v qt="${QT_LIB}/" 'index($3, qt) == 1 { print $3 }' \
               | while read -r dep; do cp -aL "${dep}" qt-runtime/; done
