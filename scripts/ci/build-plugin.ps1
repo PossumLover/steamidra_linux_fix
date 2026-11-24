@@ -28,7 +28,8 @@ if ($ReleaseTag) {
 }
 
 if (-not (Test-Path (Join-Path $SdkDir "cmake\ArachnelPluginSdk.cmake"))) {
-    git clone --depth 1 --branch $env:ARACHNEL_SDK_REF https://github.com/BadKiko/Arachnel.git $SdkDir
+    $sdkUrl = if ($env:ARACHNEL_SDK_GIT_URL) { $env:ARACHNEL_SDK_GIT_URL } else { "https://github.com/BadKiko/Arachnel.git" }
+    git clone --depth 1 --branch $env:ARACHNEL_SDK_REF $sdkUrl $SdkDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 

@@ -17,7 +17,7 @@ RELEASE_TAG="${RELEASE_TAG:-${CI_COMMIT_TAG:-}}"
 if [[ ! -f "${SDK_DIR}/cmake/ArachnelPluginSdk.cmake" ]]; then
   rm -rf "${SDK_DIR}"
   git clone --depth 1 --branch "${ARACHNEL_SDK_REF}" \
-    https://github.com/BadKiko/Arachnel.git "${SDK_DIR}"
+    "${ARACHNEL_SDK_GIT_URL:-https://github.com/BadKiko/Arachnel.git}" "${SDK_DIR}"
 fi
 
 DEPOTKIT_DIR="${DEPOTKIT_DIR:-${ROOT}/.ci/depotkit}"
