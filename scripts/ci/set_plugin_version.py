@@ -14,7 +14,7 @@ def main() -> int:
         print("usage: set_plugin_version.py <tag>", file=sys.stderr)
         return 2
     version = re.sub(r"^v", "", sys.argv[1].strip(), count=1)
-    if not re.fullmatch(r"\d+\.\d+\.\d+(-[\w.]+)?", version):
+    if not re.fullmatch(r"\d+\.\d+\.\d+(\.\d+)?(-[\w.]+)?", version):
         print(f"invalid semver tag: {sys.argv[1]!r}", file=sys.stderr)
         return 2
 
