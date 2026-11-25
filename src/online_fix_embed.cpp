@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
 #include <QTemporaryDir>
@@ -346,6 +347,44 @@ X86OnlineFixResolved resolveX86OnlineFixKit(const QString& kit)
 void writeOnlineFixIni(const QString& path, const QString& realAppId, const QString& fakeAppId,
                       bool unlockAllDlc = true)
 {
+    // A game-specific online-fix.me fix ships an ini with [Interfaces] and the game's
+    // [Hashes]. Replacing it with the generic one below dropped the hash, and Online
+    // Fix then refused the game ("Self-protection failed", error 4) on the very next
+    // launch - Valheim's own fix never got to run. Keep such a file; only add a missing
+    // RealAppId to [Main], which is the one thing this writer exists to guarantee.
+    {
+        QFile existing(path);
+        if (existing.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QString text = QString::fromUtf8(existing.readAll());
+            existing.close();
+            static const QRegularExpression gameSpecific(
+                QStringLiteral("^\\s*\\[(Hashes|Interfaces)\\]"),
+                QRegularExpression::MultilineOption | QRegularExpression::CaseInsensitiveOption);
+            if (text.contains(gameSpecific)) {
+                static const QRegularExpression hasRealId(
+                    QStringLiteral("^\\s*RealAppId\\s*="),
+                    QRegularExpression::MultilineOption | QRegularExpression::CaseInsensitiveOption);
+                if (text.contains(hasRealId) || realAppId.isEmpty()
+                    || realAppId == QStringLiteral("0") || realAppId == QStringLiteral("480"))
+                    return;
+                static const QRegularExpression mainHeader(
+                    QStringLiteral("^\\s*\\[Main\\]\\s*$"),
+                    QRegularExpression::MultilineOption | QRegularExpression::CaseInsensitiveOption);
+                const QRegularExpressionMatch m = mainHeader.match(text);
+                if (!m.hasMatch())
+                    return;
+                const QString eol = text.contains(QStringLiteral("\r\n")) ? QStringLiteral("\r\n")
+                                                                           : QStringLiteral("\n");
+                text.insert(m.capturedEnd(), eol + QStringLiteral("RealAppId=") + realAppId);
+                QSaveFile out(path);
+                if (out.open(QIODevice::WriteOnly)) {
+                    out.write(text.toUtf8());
+                    out.commit();
+                }
+                return;
+            }
+        }
+    }
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly))
         return;
