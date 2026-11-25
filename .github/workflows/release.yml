@@ -261,12 +261,24 @@ jobs:
       download_url: ${{ steps.publish.outputs.download_url }}
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: steam-universal
           path: dist/universal
+
+      - name: Generate steamidra release feed
+        run: |
+          ASSET=dist/universal/steam.arach
+          SHA256="$(sha256sum "${ASSET}")"
+          SIZE="$(stat -c %s "${ASSET}")"
+          jq -n --arg version "${TAG#v}" \
+            --arg url "https://github.com/${RELEASE_REPO}/releases/download/${TAG}/steam.arach" \
+            --arg sha256 "${SHA256%% *}" --argjson size "${SIZE}" \
+            '{schemaVersion:1,id:"steamidra",version:$version,url:$url,sha256:$sha256,size:$size,apiVersion:4,abiToken:"api=4"}' \
+            > dist/universal/steamidra-feed.json
 
       - name: Publish GitHub Release
         id: publish
@@ -282,16 +294,17 @@ jobs:
           older launchers keep installing the last API v3 package from sourcelist history.
           EOF
 
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" dist/universal/steam.arach --clobber --repo "${GITHUB_REPOSITORY}"
+          ASSETS=(dist/universal/steam.arach dist/universal/steamidra-feed.json)
+          if gh release view "${TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber --repo "${RELEASE_REPO}"
           else
-            gh release create "${TAG}" dist/universal/steam.arach \
-              --repo "${GITHUB_REPOSITORY}" \
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --repo "${RELEASE_REPO}" \
               --target "${GITHUB_SHA}" \
               --title "Steam plugin ${TAG}" \
               --notes-file release-notes.md
           fi
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/steam.arach"
+          URL="https://github.com/${RELEASE_REPO}/releases/download/${TAG}/steam.arach"
           echo "download_url=${URL}" >> "${GITHUB_OUTPUT}"
           echo "Published ${URL}"
 
