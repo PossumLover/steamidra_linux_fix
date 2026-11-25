@@ -44,6 +44,8 @@ set(DEPOTKIT_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(_DEPOTKIT_SRC "${CMAKE_BINARY_DIR}/_deps/depotkit-src")
 file(COPY "${DEPOTKIT_DIR}/" DESTINATION "${_DEPOTKIT_SRC}")
 find_program(PYTHON_FOR_HARDEN NAMES python3 python REQUIRED)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/cmake/harden_depotkit.py")
 execute_process(
     COMMAND "${PYTHON_FOR_HARDEN}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/harden_depotkit.py"
             "${_DEPOTKIT_SRC}"

@@ -669,6 +669,13 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         QMutexLocker lock(&m_cancelMutex);
         return m_cancelledJobs.contains(jobId);
     };
+    auto beginCleanup = [this, jobId]() {
+        QMutexLocker lock(&m_cancelMutex);
+        if (m_cancelledJobs.contains(jobId))
+            return false;
+        m_cleanupJobs.insert(jobId);
+        return true;
+    };
 
     if (onProgress) {
         arachnel::core::OwnedDownloadProgress p;
@@ -694,7 +701,7 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
         || installMode.compare(QStringLiteral("force"), Qt::CaseInsensitive) == 0;
     const InstallPipelineResult pipe =
         runInstallPipeline(m_rootPath, appId, title, targetPath, settings, forceUpdate,
-                           selectedAddonIds, onProgress, cancelled, ctrl);
+                           selectedAddonIds, onProgress, cancelled, ctrl, beginCleanup);
 
     {
         QMutexLocker lock(&m_downloadCtrlMutex);
@@ -702,7 +709,13 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
     }
     depotkit_control_destroy(ctrl);
 
-    if (cancelled()) {
+    bool wasCancelled;
+    {
+        QMutexLocker lock(&m_cancelMutex);
+        wasCancelled = m_cancelledJobs.remove(jobId);
+        m_cleanupJobs.remove(jobId);
+    }
+    if (wasCancelled) {
         result.error = QStringLiteral("Cancelled");
         return result;
     }
@@ -723,6 +736,9 @@ arachnel::core::InstallResult SteamidraPlugin::startOwnedDownload(
 void SteamidraPlugin::cancelOwnedDownload(const QString& jobId) const
 {
     QMutexLocker lock(&m_cancelMutex);
+    // Once cleanup can change the install, let the job report its actual result.
+    if (m_cleanupJobs.contains(jobId))
+        return;
     m_cancelledJobs.insert(jobId);
     QMutexLocker ctrlLock(&m_downloadCtrlMutex);
     if (depotkit_control* ctrl = m_downloadControls.value(jobId, nullptr))

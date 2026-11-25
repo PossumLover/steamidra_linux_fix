@@ -7,6 +7,7 @@
 
 #include <depotkit.h>
 
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
@@ -17,13 +18,17 @@
 #include <QJsonObject>
 #include <QHash>
 #include <QMap>
+#include <QMutex>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
+#include <QSharedPointer>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
 #include <climits>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -33,6 +38,9 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#elif defined(Q_OS_UNIX)
+#  include <cerrno>
+#  include <sys/stat.h>
 #endif
 
 namespace steamidra {
@@ -441,6 +449,7 @@ struct DepotkitProgressBridge {
     std::function<bool()> shouldCancel;
     depotkit_control* ctrl = nullptr;
     QString lastDetail;
+    bool skippedDepot = false;
 };
 
 void depotkitProgressThunk(const depotkit_progress* p, void* user)
@@ -450,6 +459,10 @@ void depotkitProgressThunk(const depotkit_progress* p, void* user)
         return;
     if (bridge->shouldCancel && bridge->shouldCancel() && bridge->ctrl)
         depotkit_cancel(bridge->ctrl);
+    // A partially planned download can still return DEPOTKIT_OK.
+    if (p->phase == DEPOTKIT_PHASE_PLANNING && p->detail
+        && QByteArrayView(p->detail).startsWith("Skipping depot "))
+        bridge->skippedDepot = true;
 
     int pct = 0;
     if (p->bytes_total > 0)
@@ -475,13 +488,54 @@ void depotkitProgressThunk(const depotkit_progress* p, void* user)
                  static_cast<qint64>(p->bytes_total), bps);
 }
 
-void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& dest,
+bool isInventoryPath(const QString& path)
+{
+    if (QDir::isAbsolutePath(path) || path.contains(QLatin1Char('\\'))
+        || path.contains(QLatin1Char(':')) || path.contains(QChar::Null))
+        return false;
+    for (const QString& part : path.split(QLatin1Char('/'))) {
+        if (part.isEmpty() || part == QStringLiteral(".") || part == QStringLiteral(".."))
+            return false;
+#if defined(Q_OS_WIN)
+        // Win32 can trim these suffixes before looking up a component.
+        if (part.endsWith(QLatin1Char('.')) || part.endsWith(QLatin1Char(' ')))
+            return false;
+#endif
+    }
+    return true;
+}
+
+struct ManifestFiles {
+    QJsonArray files;
+    bool valid = true;
+};
+
+void collectManifestFile(const char* name, uint64_t size, const uint8_t* sha1, uint32_t flags,
+                         void* user)
+{
+    auto& entries = *static_cast<ManifestFiles*>(user);
+    const QString path = QString::fromUtf8(name);
+    const bool dir = flags & DEPOTKIT_FILE_DIRECTORY;
+    if (!isInventoryPath(path) || path.toUtf8() != name
+        || (!dir && (!sha1 || size > uint64_t(std::numeric_limits<qint64>::max())))) {
+        entries.valid = false;
+        return;
+    }
+    QJsonObject file{{QStringLiteral("path"), path}, {QStringLiteral("dir"), dir}};
+    if (!dir) {
+        file.insert(QStringLiteral("size"), static_cast<qint64>(size));
+        file.insert(QStringLiteral("sha1"),
+                    QString::fromLatin1(
+                        QByteArray(reinterpret_cast<const char*>(sha1), 20).toHex()));
+    }
+    entries.files.append(file);
+}
+
+QJsonObject runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& dest,
                  const QString& staging, const QString& depotOs, bool forceUpdate,
                  const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
                  const std::function<bool()>& shouldCancel, depotkit_control* externalCtrl)
 {
-    QDir().mkpath(dest);
-
     QStringList depotIds = parsed.depots.keys();
     if (depotIds.isEmpty())
         depotIds = parsed.manifests.keys();
@@ -676,6 +730,540 @@ void runDepotkit(const QString& appid, const LuaParsed& parsed, const QString& d
         throw std::runtime_error(
             QStringLiteral("depotkit failed: %1").arg(why).toStdString());
     }
+
+    // Explicitly excluded OS depots are outside the request. A missing or
+    // unmatchable depot for the selected OS makes the inventory incomplete.
+    for (const QString& depotId : depotIds) {
+        if (!steamSaysOtherOs(depotId) && !matchedIds.contains(depotId)) {
+            qWarning().noquote() << "[steamidra] keeping file inventory: skipped depot" << depotId;
+            return {};
+        }
+    }
+    if (bridge.skippedDepot || held.size() != matched.size()) {
+        qWarning() << "[steamidra] keeping file inventory: incomplete depot download";
+        return {};
+    }
+
+    QJsonArray inventoryDepots;
+    for (const depotkit_depot& depot : depots) {
+        if (shouldCancel && shouldCancel())
+            throw std::runtime_error("Cancelled");
+        ManifestFiles entries;
+        uint64_t manifestId = 0;
+        uint32_t manifestDepotId = 0;
+        const depotkit_result listResult =
+            depotkit_manifest_list_files(depot.manifest_path, depot.key_hex, collectManifestFile,
+                                         &entries, &manifestId, &manifestDepotId);
+        // A manifest that names another depot (mislabelled relay data) must never stand in
+        // for this depot's file list: an empty or foreign list would mark every file this
+        // depot owned as obsolete.
+        if (listResult != DEPOTKIT_OK || !entries.valid || !manifestId
+            || manifestDepotId != depot.depot_id) {
+            qWarning() << "[steamidra] keeping file inventory: unreadable file list for depot"
+                       << depot.depot_id;
+            return {};
+        }
+        inventoryDepots.append(QJsonObject{
+            {QStringLiteral("depotId"), QString::number(depot.depot_id)},
+            {QStringLiteral("manifestId"), QString::number(static_cast<qulonglong>(manifestId))},
+            {QStringLiteral("files"), entries.files}});
+    }
+    return {{QStringLiteral("version"), 1},
+            {QStringLiteral("appId"), appid},
+            {QStringLiteral("os"), wantOsName},
+            {QStringLiteral("depots"), inventoryDepots}};
+}
+
+QString inventoryPathKey(const QString& path)
+{
+#if defined(Q_OS_WIN)
+    return path.toCaseFolded();
+#else
+    return path;
+#endif
+}
+
+#if defined(Q_OS_WIN)
+QString resolvedWindowsPath(const QString& path, bool& missing)
+{
+    missing = false;
+    const QString native = QDir::toNativeSeparators(path);
+    const HANDLE handle = CreateFileW(reinterpret_cast<const wchar_t*>(native.utf16()), 0,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        missing = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+        return {};
+    }
+    // The normalized name covers DOS short names and aliases through junctions.
+    std::wstring resolved(512, L'\0');
+    DWORD length = GetFinalPathNameByHandleW(handle, resolved.data(),
+                                             static_cast<DWORD>(resolved.size()), 0);
+    if (length >= resolved.size()) {
+        resolved.resize(length + 1);
+        length = GetFinalPathNameByHandleW(handle, resolved.data(),
+                                           static_cast<DWORD>(resolved.size()), 0);
+    }
+    CloseHandle(handle);
+    if (length == 0 || length >= resolved.size())
+        return {};
+    return QString::fromWCharArray(resolved.data(), length);
+}
+#endif
+
+QSharedPointer<QMutex> installMutex(const QString& path)
+{
+    static QMutex registryMutex;
+    static QHash<QString, QWeakPointer<QMutex>> registry;
+    const QFileInfo dir(path);
+    QString canonical = dir.canonicalFilePath();
+#if defined(Q_OS_WIN)
+    bool missing = false;
+    const QString resolved = resolvedWindowsPath(dir.absoluteFilePath(), missing);
+    if (!resolved.isEmpty())
+        canonical = resolved;
+#endif
+    const QString key = inventoryPathKey(canonical.isEmpty() ? dir.absoluteFilePath() : canonical);
+    QMutexLocker lock(&registryMutex);
+    for (auto it = registry.begin(); it != registry.end();) {
+        if (it.value().isNull())
+            it = registry.erase(it);
+        else
+            ++it;
+    }
+    auto mutex = registry.value(key).toStrongRef();
+    if (!mutex) {
+        mutex = QSharedPointer<QMutex>::create();
+        registry.insert(key, mutex.toWeakRef());
+    }
+    return mutex;
+}
+
+bool isLinkOrReparsePoint(const QFileInfo& info)
+{
+    if (info.isSymLink())
+        return true;
+#if defined(Q_OS_WIN)
+    const QString native = QDir::toNativeSeparators(info.absoluteFilePath());
+    const DWORD attrs = GetFileAttributesW(reinterpret_cast<const wchar_t*>(native.utf16()));
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    return false;
+#endif
+}
+
+bool isProtectedInventoryPath(const QString& path)
+{
+    static const QSet<QString> protectedNames{
+        QStringLiteral("steamfix64.dll"), QStringLiteral("steamfix32.dll"),
+        QStringLiteral("steamfix.ini"), QStringLiteral("winmm.dll"),
+        QStringLiteral("winmm.txt"), QStringLiteral("onlinefix64.dll"),
+        QStringLiteral("onlinefix.dll"), QStringLiteral("onlinefix.ini"),
+        QStringLiteral("dlllist.txt"), QStringLiteral("steamoverlay64.dll"),
+        QStringLiteral("steamoverlay32.dll"), QStringLiteral("stubdrm64.dll"),
+        QStringLiteral("stubdrm32.dll"), QStringLiteral("epicfix64.dll"),
+        QStringLiteral("epicfix.ini"), QStringLiteral("steam_appid.txt"),
+        QStringLiteral("unsteam.dll"), QStringLiteral("unsteam.ini")};
+    const QStringList parts = path.toLower().split(QLatin1Char('/'));
+    for (qsizetype i = 0; i < parts.size(); ++i) {
+        const QString& part = parts.at(i);
+        if (protectedNames.contains(part) || part.startsWith(QStringLiteral(".arachnel"))
+            || part.endsWith(QStringLiteral(".arachnel-off"))
+            || part.endsWith(QStringLiteral(".arachnel-valve")))
+            return true;
+        if (i + 1 < parts.size()
+            && (part == QStringLiteral("userdata") || part == QStringLiteral("freetp")
+                || part == QStringLiteral("saved")))
+            return true;
+        if ((part.startsWith(QStringLiteral("steam_api.dll."))
+             || part.startsWith(QStringLiteral("steam_api64.dll.")))
+            && part.endsWith(QStringLiteral("bak")))
+            return true;
+    }
+    return false;
+}
+
+bool isInventoryId(const QJsonValue& value)
+{
+    const QString text = value.toString();
+    bool ok = false;
+    const qulonglong id = text.toULongLong(&ok);
+    return ok && id && text == QString::number(id);
+}
+
+bool validInventoryFile(const QJsonObject& file)
+{
+    static const QRegularExpression sha1(QStringLiteral("\\A[0-9a-f]{40}\\z"));
+    return file.value(QStringLiteral("dir")).isBool()
+           && isInventoryPath(file.value(QStringLiteral("path")).toString())
+           && (file.value(QStringLiteral("dir")).toBool()
+               || (file.value(QStringLiteral("size")).toInteger(-1) >= 0
+                   && sha1.match(file.value(QStringLiteral("sha1")).toString()).hasMatch()));
+}
+
+bool validPreviousInventory(const QJsonObject& previous, const QString& appid)
+{
+    const QString os = previous.value(QStringLiteral("os")).toString();
+    if (previous.value(QStringLiteral("version")).toInteger() != 1
+        || previous.value(QStringLiteral("appId")).toString() != appid
+        || (os != QStringLiteral("windows") && os != QStringLiteral("linux")
+            && os != QStringLiteral("macos"))
+        || !previous.value(QStringLiteral("depots")).isArray())
+        return false;
+    QSet<QString> depotIds;
+    for (const QJsonValue& value : previous.value(QStringLiteral("depots")).toArray()) {
+        const QJsonObject depot = value.toObject();
+        const QJsonValue id = depot.value(QStringLiteral("depotId"));
+        if (!isInventoryId(id) || depotIds.contains(id.toString())
+            || !isInventoryId(depot.value(QStringLiteral("manifestId")))
+            || !depot.value(QStringLiteral("files")).isArray())
+            return false;
+        depotIds.insert(id.toString());
+        for (const QJsonValue& entry : depot.value(QStringLiteral("files")).toArray()) {
+            if (!validInventoryFile(entry.toObject()))
+                return false;
+        }
+    }
+    const auto pending = previous.value(QStringLiteral("pending"));
+    if (!pending.isUndefined() && !pending.isArray())
+        return false;
+    for (const QJsonValue& entry : pending.toArray()) {
+        const QJsonObject file = entry.toObject();
+        if (!validInventoryFile(file) || file.value(QStringLiteral("dir")).toBool())
+            return false;
+    }
+    return true;
+}
+
+enum class StalePathType { Missing, Unavailable, Other, Directory, Regular };
+
+struct StaleFileStamp {
+    qint64 size = 0;
+    qint64 modified = 0;
+    qint64 modifiedNanos = 0;
+
+    bool operator==(const StaleFileStamp& other) const
+    {
+        return size == other.size && modified == other.modified
+               && modifiedNanos == other.modifiedNanos;
+    }
+};
+
+StalePathType stalePathType(const QString& path, StaleFileStamp& stamp)
+{
+#if defined(Q_OS_WIN)
+    const QString native = QDir::toNativeSeparators(path);
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(reinterpret_cast<const wchar_t*>(native.utf16()),
+                              GetFileExInfoStandard, &data)) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+                   ? StalePathType::Missing : StalePathType::Unavailable;
+    }
+    if (data.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))
+        return StalePathType::Other;
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return StalePathType::Directory;
+    stamp.size = (quint64(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    stamp.modified = (quint64(data.ftLastWriteTime.dwHighDateTime) << 32)
+                     | data.ftLastWriteTime.dwLowDateTime;
+    return StalePathType::Regular;
+#elif defined(Q_OS_UNIX)
+    struct stat data{};
+    if (lstat(QFile::encodeName(path).constData(), &data) != 0)
+        return errno == ENOENT ? StalePathType::Missing : StalePathType::Unavailable;
+    if (S_ISDIR(data.st_mode))
+        return StalePathType::Directory;
+    if (!S_ISREG(data.st_mode))
+        return StalePathType::Other;
+    stamp.size = data.st_size;
+#  if defined(Q_OS_DARWIN)
+    stamp.modified = data.st_mtimespec.tv_sec;
+    stamp.modifiedNanos = data.st_mtimespec.tv_nsec;
+#  else
+    stamp.modified = data.st_mtim.tv_sec;
+    stamp.modifiedNanos = data.st_mtim.tv_nsec;
+#  endif
+    return StalePathType::Regular;
+#else
+    return StalePathType::Unavailable;
+#endif
+}
+
+StalePathType staleFileStamp(const QDir& root, const QString& relativePath, StaleFileStamp& stamp)
+{
+    QString path = root.absolutePath();
+    if (stalePathType(path, stamp) != StalePathType::Directory)
+        return StalePathType::Unavailable;
+    const QStringList parts = relativePath.split(QLatin1Char('/'));
+    for (qsizetype i = 0; i < parts.size(); ++i) {
+        path = QDir(path).filePath(parts.at(i));
+        const auto type = stalePathType(path, stamp);
+        if (i + 1 == parts.size())
+            return type;
+        if (type != StalePathType::Directory)
+            return type == StalePathType::Regular ? StalePathType::Other : type;
+    }
+    return StalePathType::Other;
+}
+
+void reconcileInventory(const QString& installPath, QJsonObject inventory,
+                        const std::function<void()>& checkCancelled,
+                        const std::function<bool()>& beginCleanup)
+{
+    const QFileInfo install(QDir::cleanPath(installPath));
+    const QString canonicalRoot = install.canonicalFilePath();
+    if (!install.isDir() || canonicalRoot.isEmpty() || isLinkOrReparsePoint(install)) {
+        qWarning().noquote() << "[steamidra] unsafe file inventory root" << installPath;
+        return;
+    }
+    const auto rootStillSafe = [&]() {
+        const QFileInfo current(install.absoluteFilePath());
+        return !isLinkOrReparsePoint(current) && current.canonicalFilePath() == canonicalRoot;
+    };
+    const QDir root(canonicalRoot);
+    const QString markerPath = root.filePath(QStringLiteral(".arachnel-steamidra-files"));
+    const QFileInfo markerInfo(markerPath);
+    if (isLinkOrReparsePoint(markerInfo) || (markerInfo.exists() && !markerInfo.isFile())) {
+        qWarning().noquote() << "[steamidra] unsafe file inventory" << markerPath;
+        return;
+    }
+
+    QJsonArray oldDepots;
+    QJsonArray oldPending;
+    if (markerInfo.exists()) {
+        QFile marker(markerPath);
+        if (!marker.open(QIODevice::ReadOnly)) {
+            qWarning().noquote() << "[steamidra] cannot read file inventory" << marker.errorString();
+            return;
+        }
+        const QJsonObject previous = QJsonDocument::fromJson(marker.readAll()).object();
+        if (marker.error() != QFileDevice::NoError
+            || !validPreviousInventory(previous, inventory.value(QStringLiteral("appId")).toString())) {
+            qWarning().noquote() << "[steamidra] invalid file inventory" << markerPath;
+            return;
+        }
+        oldDepots = previous.value(QStringLiteral("depots")).toArray();
+        oldPending = previous.value(QStringLiteral("pending")).toArray();
+    }
+
+    QJsonArray depots = inventory.value(QStringLiteral("depots")).toArray();
+    QSet<QString> updatedDepots;
+    for (const QJsonValue& value : depots)
+        updatedDepots.insert(value.toObject().value(QStringLiteral("depotId")).toString());
+    // An omitted depot may be deselected DLC or missing relay data.
+    for (const QJsonValue& value : oldDepots) {
+        if (!updatedDepots.contains(value.toObject().value(QStringLiteral("depotId")).toString()))
+            depots.append(value);
+    }
+
+    QSet<QString> currentPaths;
+    for (const QJsonValue& value : depots) {
+        for (const QJsonValue& entry : value.toObject().value(QStringLiteral("files")).toArray()) {
+            checkCancelled();
+            const QString path = entry.toObject().value(QStringLiteral("path")).toString();
+            currentPaths.insert(inventoryPathKey(path));
+        }
+    }
+
+    QHash<QString, QJsonObject> stale;
+    QSet<QString> disputed;
+    const auto collectStale = [&](const QJsonArray& files) {
+        for (const QJsonValue& entry : files) {
+            checkCancelled();
+            const QJsonObject file = entry.toObject();
+            const QString path = file.value(QStringLiteral("path")).toString();
+            const QString key = inventoryPathKey(path);
+            if (currentPaths.contains(key) || isProtectedInventoryPath(path))
+                continue;
+            const auto existing = stale.constFind(key);
+            if (existing == stale.constEnd())
+                stale.insert(key, file);
+            else if (*existing != file)
+                disputed.insert(key);
+        }
+    };
+    for (const QJsonValue& value : oldDepots)
+        collectStale(value.toObject().value(QStringLiteral("files")).toArray());
+    collectStale(oldPending);
+
+#if defined(Q_OS_WIN)
+    QSet<QString> currentAliases;
+    QHash<QString, QString> staleAliases;
+    QString resolvedRoot;
+    if (!stale.isEmpty()) {
+        bool missing = false;
+        resolvedRoot = QDir::fromNativeSeparators(resolvedWindowsPath(canonicalRoot, missing));
+        if (resolvedRoot.isEmpty()) {
+            qWarning().noquote() << "[steamidra] cannot resolve file inventory root" << canonicalRoot;
+            return;
+        }
+        if (!resolvedRoot.endsWith(QLatin1Char('/')))
+            resolvedRoot += QLatin1Char('/');
+
+        // Keep the original spelling for lookup even when the install uses case-sensitive directories.
+        for (const QJsonValue& value : depots) {
+            for (const QJsonValue& entry : value.toObject().value(QStringLiteral("files")).toArray()) {
+                checkCancelled();
+                const QString path = entry.toObject().value(QStringLiteral("path")).toString();
+                const QString resolved = resolvedWindowsPath(root.filePath(path), missing);
+                if (resolved.isEmpty() && !missing) {
+                    qWarning().noquote() << "[steamidra] cannot check current path aliases" << path;
+                    return;
+                }
+                if (!resolved.isEmpty())
+                    currentAliases.insert(inventoryPathKey(resolved));
+            }
+        }
+        // Two prior spellings may refer to the same directory entry via a DOS short name.
+        for (auto it = stale.constBegin(); it != stale.constEnd(); ++it) {
+            checkCancelled();
+            const QString path = it.value().value(QStringLiteral("path")).toString();
+            StaleFileStamp stamp;
+            if (staleFileStamp(root, path, stamp) != StalePathType::Regular)
+                continue;
+            const QString resolved = resolvedWindowsPath(root.filePath(path), missing);
+            if (resolved.isEmpty()) {
+                if (!missing)
+                    qWarning().noquote() << "[steamidra] cannot check stale path aliases" << path;
+                continue;
+            }
+            const QString alias = inventoryPathKey(resolved);
+            const auto other = staleAliases.constFind(alias);
+            if (other == staleAliases.constEnd()) {
+                staleAliases.insert(alias, it.key());
+            } else {
+                disputed.insert(it.key());
+                disputed.insert(*other);
+            }
+        }
+    }
+#endif
+
+    struct PreparedRemoval {
+        QJsonObject entry;
+        StaleFileStamp stamp;
+#if defined(Q_OS_WIN)
+        QString resolved;
+#endif
+    };
+    QVector<PreparedRemoval> removals;
+    QJsonArray pending;
+    for (auto it = stale.constBegin(); it != stale.constEnd(); ++it) {
+        checkCancelled();
+        const QJsonObject& entry = it.value();
+        if (disputed.contains(it.key()) || entry.value(QStringLiteral("dir")).toBool())
+            continue;
+        PreparedRemoval removal;
+        removal.entry = entry;
+        const QString path = entry.value(QStringLiteral("path")).toString();
+        const QString absolutePath = root.filePath(path);
+        const qint64 size = entry.value(QStringLiteral("size")).toInteger();
+        StaleFileStamp& stamp = removal.stamp;
+        const auto type = staleFileStamp(root, path, stamp);
+        if (type == StalePathType::Unavailable || type == StalePathType::Other) {
+            qWarning().noquote() << "[steamidra] cannot safely inspect stale" << absolutePath;
+            pending.append(entry);
+            continue;
+        }
+        if (type != StalePathType::Regular || stamp.size != size)
+            continue;
+#if defined(Q_OS_WIN)
+        bool missing = false;
+        const QString resolved = resolvedWindowsPath(absolutePath, missing);
+        if (resolved.isEmpty()) {
+            qWarning().noquote() << "[steamidra] cannot check stale path aliases" << absolutePath;
+            pending.append(entry);
+            continue;
+        }
+        const QString normalized = QDir::fromNativeSeparators(resolved);
+        if (!normalized.startsWith(resolvedRoot)) {
+            qWarning().noquote() << "[steamidra] refusing stale path outside install" << absolutePath;
+            continue;
+        }
+        const QString alias = inventoryPathKey(resolved);
+        if (currentAliases.contains(alias)
+            || isProtectedInventoryPath(normalized.mid(resolvedRoot.size())))
+            continue;
+        if (staleAliases.value(alias) != it.key()) {
+            qWarning().noquote() << "[steamidra] stale path alias changed" << absolutePath;
+            pending.append(entry);
+            continue;
+        }
+        removal.resolved = resolved;
+#endif
+        QFile file(absolutePath);
+        QCryptographicHash sha1(QCryptographicHash::Sha1);
+        if (file.open(QIODevice::ReadOnly)) {
+            while (!file.atEnd()) {
+                checkCancelled();
+                const QByteArray chunk = file.read(256 * 1024);
+                if (chunk.isEmpty())
+                    break;
+                sha1.addData(chunk);
+            }
+        }
+        StaleFileStamp checked;
+        if (!file.isOpen() || file.error() != QFileDevice::NoError || file.pos() != size
+            || staleFileStamp(root, path, checked) != StalePathType::Regular
+            || !(checked == stamp)) {
+            qWarning().noquote() << "[steamidra] cannot hash stale" << absolutePath
+                                 << file.errorString();
+            pending.append(entry);
+            continue;
+        }
+        if (sha1.result().toHex() != entry.value(QStringLiteral("sha1")).toString().toLatin1())
+            continue;
+        removals.append(removal);
+    }
+
+    // Cancellation can win while preparing candidates, before either files or the marker change.
+    checkCancelled();
+    if (!beginCleanup())
+        throw std::runtime_error("Cancelled");
+
+    for (const auto& removal : removals) {
+        const QString path = removal.entry.value(QStringLiteral("path")).toString();
+        const QString absolutePath = root.filePath(path);
+#if defined(Q_OS_WIN)
+        bool missing = false;
+        const bool aliasUnchanged = resolvedWindowsPath(absolutePath, missing) == removal.resolved;
+#else
+        const bool aliasUnchanged = true;
+#endif
+        // Every component can have changed while other candidates were being hashed.
+        StaleFileStamp checked;
+        const auto type = rootStillSafe() ? staleFileStamp(root, path, checked)
+                                          : StalePathType::Unavailable;
+        if (type == StalePathType::Missing)
+            continue;
+        if (!aliasUnchanged || type != StalePathType::Regular || !(checked == removal.stamp)) {
+            qWarning().noquote() << "[steamidra] stale path changed before removal" << absolutePath;
+            pending.append(removal.entry);
+            continue;
+        }
+        QFile file(absolutePath);
+        if (file.remove())
+            qInfo().noquote() << "[steamidra] removed stale" << absolutePath;
+        else {
+            qWarning().noquote() << "[steamidra] cannot remove stale" << absolutePath
+                                 << file.errorString();
+            pending.append(removal.entry);
+        }
+    }
+
+    inventory.insert(QStringLiteral("depots"), depots);
+    // Retry these hashes without treating their paths as part of any current manifest.
+    if (!pending.isEmpty())
+        inventory.insert(QStringLiteral("pending"), pending);
+    const QByteArray bytes = QJsonDocument(inventory).toJson(QJsonDocument::Compact);
+    QSaveFile marker(markerPath);
+    if (!rootStillSafe() || isLinkOrReparsePoint(QFileInfo(markerPath))
+        || !marker.open(QIODevice::WriteOnly)
+        || marker.write(bytes) != bytes.size() || !marker.commit())
+        qWarning().noquote() << "[steamidra] cannot write file inventory" << markerPath
+                             << marker.errorString();
 }
 
 QString sanitizeInstallDir(const QString& title, const QString& appid)
@@ -767,7 +1355,8 @@ InstallPipelineResult runInstallPipeline(
     const QString& pluginRoot, const QString& appid, const QString& title, const QString& targetPath,
     const PluginSettings& settings, bool force, const QStringList& selectedAddonIds,
     const std::function<void(const arachnel::core::OwnedDownloadProgress&)>& onProgress,
-    const std::function<bool()>& shouldCancel, depotkit_control* downloadCtrl)
+    const std::function<bool()>& shouldCancel, depotkit_control* downloadCtrl,
+    const std::function<bool()>& beginCleanup)
 {
     InstallPipelineResult result;
     try {
@@ -832,8 +1421,21 @@ InstallPipelineResult runInstallPipeline(
         QString depotOs = settings.depotOs.trimmed();
         if (depotOs.isEmpty() || depotOs.compare(QStringLiteral("auto"), Qt::CaseInsensitive) == 0)
             depotOs = QStringLiteral("windows");
-        runDepotkit(app, parsed, installPath, staging.path(), depotOs, force, onProgress,
-                    shouldCancel, downloadCtrl);
+        QDir().mkpath(installPath);
+        const auto mutex = installMutex(installPath);
+        QMutexLocker installLock(mutex.data());
+        const QJsonObject inventory =
+            runDepotkit(app, parsed, installPath, staging.path(), depotOs, force, onProgress,
+                        shouldCancel, downloadCtrl);
+        const auto checkCancelled = [&]() {
+            if ((shouldCancel && shouldCancel())
+                || (downloadCtrl && depotkit_is_cancelled(downloadCtrl)))
+                throw std::runtime_error("Cancelled");
+        };
+        checkCancelled();
+        if (!inventory.isEmpty())
+            reconcileInventory(installPath, inventory, checkCancelled, beginCleanup);
+        checkCancelled();
 
         QJsonObject settingsJson;
         settingsJson.insert(QStringLiteral("autoEmbedOnlineFix"), settings.autoEmbedOnlineFix);

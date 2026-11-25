@@ -123,6 +123,48 @@ def patch_manifest(text: str) -> str:
     return text.replace(MANIFEST_OLD, MANIFEST_NEW, 1)
 
 
+FILE_LIST_PAYLOAD_MARKER = "steamidra: distinguish missing and empty file lists"
+FILE_LIST_MANIFEST_HEADER_OLD = """    std::vector<FileInfo> files;
+};"""
+FILE_LIST_MANIFEST_HEADER_NEW = f"""    std::vector<FileInfo> files;
+    // {FILE_LIST_PAYLOAD_MARKER}
+    bool hasFileList = false;
+}};"""
+FILE_LIST_BINARY_OLD = """            parseBinaryManifest(m, c);
+            // trailing marker"""
+FILE_LIST_BINARY_NEW = """            parseBinaryManifest(m, c);
+            m.hasFileList = true;
+            // trailing marker"""
+FILE_LIST_PAYLOAD_OLD = """                if (magic == kProtoPayloadMagic)
+                    parsePayload(m, sub);
+                else
+                    parseMetadata(m, sub);"""
+FILE_LIST_PAYLOAD_NEW = f"""                // {FILE_LIST_PAYLOAD_MARKER}
+                if (magic == kProtoPayloadMagic) {{
+                    parsePayload(m, sub);
+                    m.hasFileList = true;
+                }} else {{
+                    parseMetadata(m, sub);
+                }}"""
+
+
+def patch_file_list_manifest_header(text: str) -> str:
+    if FILE_LIST_PAYLOAD_MARKER in text:
+        return text
+    if FILE_LIST_MANIFEST_HEADER_OLD not in text:
+        raise SystemExit("manifest.hpp: file list field pattern missing")
+    return text.replace(FILE_LIST_MANIFEST_HEADER_OLD, FILE_LIST_MANIFEST_HEADER_NEW, 1)
+
+
+def patch_file_list_manifest(text: str) -> str:
+    if FILE_LIST_PAYLOAD_MARKER in text:
+        return text
+    if FILE_LIST_BINARY_OLD not in text or FILE_LIST_PAYLOAD_OLD not in text:
+        raise SystemExit("manifest.cpp: file list section pattern missing")
+    text = text.replace(FILE_LIST_BINARY_OLD, FILE_LIST_BINARY_NEW, 1)
+    return text.replace(FILE_LIST_PAYLOAD_OLD, FILE_LIST_PAYLOAD_NEW, 1)
+
+
 ENGINE_MARKER = "steamidra: size files to the manifest"
 ENGINE_OLD = """    if (fileSize > 0) {
         slot.stream.seekp(static_cast<std::streamoff>(fileSize > 0 ? fileSize - 1 : 0));
@@ -306,6 +348,119 @@ def patch_close_slot(text: str) -> str:
     return text.replace(FINALIZE_RESULT_OLD, FINALIZE_RESULT_NEW, 1)
 
 
+FILE_LIST_MARKER = "steamidra: expose shipped manifest entries"
+FILE_LIST_HEADER_OLD = """                                                             uint32_t *out_flags);
+
+#ifdef __cplusplus"""
+FILE_LIST_HEADER_NEW = f"""                                                             uint32_t *out_flags);
+
+/* {FILE_LIST_MARKER}. Path and SHA-1 are borrowed for the callback only. */
+enum {{ DEPOTKIT_FILE_DIRECTORY = 0x40 }};
+typedef void (*depotkit_file_fn)(const char *path, uint64_t size, const uint8_t *sha1,
+                                 uint32_t flags, void *user);
+DEPOTKIT_API depotkit_result depotkit_manifest_list_files(const char *manifest_path,
+                                                          const char *key_hex,
+                                                          depotkit_file_fn on_file,
+                                                          void *user,
+                                                          uint64_t *out_manifest_id,
+                                                          uint32_t *out_depot_id);
+
+#ifdef __cplusplus"""
+FILE_LIST_API_OLD = """depotkit_result depotkit_manifest_platform_hint(const char *manifest_path, const char *key_hex,
+                                                uint32_t *out_flags)
+{
+    if (!manifest_path || !out_flags)
+        return DEPOTKIT_ERR_INVALID_ARG;
+    *out_flags = 0;
+    try {
+        auto man = depotkit::loadManifestFile(manifest_path);
+        if (key_hex && *key_hex) {
+            auto key = depotkit::fromHex(key_hex);
+            if (key.size() != 32)
+                return DEPOTKIT_ERR_CRYPTO;
+            depotkit::decryptManifestFilenames(man, key.data());
+        }
+        uint32_t win = 0, lin = 0, mac = 0;"""
+FILE_LIST_API_NEW = f"""// {FILE_LIST_MARKER}
+static depotkit_result loadManifestWithNames(const char *manifest_path, const char *key_hex,
+                                              depotkit::Manifest &man)
+{{
+    man = depotkit::loadManifestFile(manifest_path);
+    if (key_hex && *key_hex) {{
+        auto key = depotkit::fromHex(key_hex);
+        if (key.size() != 32 || !depotkit::decryptManifestFilenames(man, key.data()))
+            return DEPOTKIT_ERR_CRYPTO;
+    }}
+    return DEPOTKIT_OK;
+}}
+
+depotkit_result depotkit_manifest_list_files(const char *manifest_path, const char *key_hex,
+                                             depotkit_file_fn on_file, void *user,
+                                             uint64_t *out_manifest_id,
+                                             uint32_t *out_depot_id)
+{{
+    if (!manifest_path || !on_file)
+        return DEPOTKIT_ERR_INVALID_ARG;
+    try {{
+        depotkit::Manifest man;
+        const auto rc = loadManifestWithNames(manifest_path, key_hex, man);
+        if (rc != DEPOTKIT_OK)
+            return rc;
+        if (!man.hasFileList)
+            return DEPOTKIT_ERR_MANIFEST;
+        if (man.filenamesEncrypted)
+            return DEPOTKIT_ERR_CRYPTO;
+        static_assert(DEPOTKIT_FILE_DIRECTORY == depotkit::kFileFlagDirectory);
+        for (auto &f : man.files) {{
+            if (f.filename.find('\\0') != std::string::npos)
+                return DEPOTKIT_ERR_MANIFEST;
+            // Report the name exactly as runDownload() joins it onto the install path.
+            // decryptManifestFilenames() already turns '\\' into '/' for encrypted names;
+            // a plaintext name that still has one is written verbatim on Linux, so the
+            // caller must not map it onto a different, '/'-separated path.
+            on_file(f.filename.c_str(), f.size,
+                    f.contentHash.size() == 20 ? f.contentHash.data() : nullptr, f.flags, user);
+        }}
+        if (out_manifest_id)
+            *out_manifest_id = man.manifestId;
+        if (out_depot_id)
+            *out_depot_id = man.depotId;
+        return DEPOTKIT_OK;
+    }} catch (...) {{
+        return DEPOTKIT_ERR_MANIFEST;
+    }}
+}}
+
+depotkit_result depotkit_manifest_platform_hint(const char *manifest_path, const char *key_hex,
+                                                uint32_t *out_flags)
+{{
+    if (!manifest_path || !out_flags)
+        return DEPOTKIT_ERR_INVALID_ARG;
+    *out_flags = 0;
+    try {{
+        depotkit::Manifest man;
+        const auto rc = loadManifestWithNames(manifest_path, key_hex, man);
+        if (rc != DEPOTKIT_OK)
+            return rc;
+        uint32_t win = 0, lin = 0, mac = 0;"""
+
+
+def patch_file_list_header(text: str) -> str:
+    if FILE_LIST_MARKER in text:
+        return text
+    if FILE_LIST_HEADER_OLD not in text:
+        raise SystemExit("depotkit.h: platform hint declaration pattern missing")
+    return text.replace(FILE_LIST_HEADER_OLD, FILE_LIST_HEADER_NEW, 1)
+
+
+def patch_file_list_api(text: str) -> str:
+    if FILE_LIST_MARKER in text:
+        return text
+    if FILE_LIST_API_OLD not in text:
+        raise SystemExit("api.cpp: platform hint loader pattern missing")
+    return text.replace(FILE_LIST_API_OLD, FILE_LIST_API_NEW, 1)
+
+
 def write_if_changed(path: Path, text: str) -> None:
     if path.read_text(encoding="utf-8") != text:
         path.write_text(text, encoding="utf-8")
@@ -318,16 +473,24 @@ def main() -> None:
     crypto = root / "src" / "crypto" / "depot_crypto.cpp"
     session = root / "src" / "steam" / "session.cpp"
     manifest = root / "src" / "manifest" / "manifest.cpp"
+    manifest_header = manifest.with_suffix(".hpp")
     engine = root / "src" / "engine" / "engine.cpp"
-    for p in (crypto, session, manifest, engine):
+    header = root / "include" / "depotkit.h"
+    api = root / "src" / "api.cpp"
+    for p in (crypto, session, manifest, manifest_header, engine, header, api):
         if not p.is_file():
             raise SystemExit(f"missing {p}")
     write_if_changed(crypto, patch_crypto(crypto.read_text(encoding="utf-8")))
     write_if_changed(session, patch_session(session.read_text(encoding="utf-8")))
-    write_if_changed(manifest, patch_manifest(manifest.read_text(encoding="utf-8")))
+    manifest_text = patch_manifest(manifest.read_text(encoding="utf-8"))
+    write_if_changed(manifest, patch_file_list_manifest(manifest_text))
+    write_if_changed(manifest_header,
+                     patch_file_list_manifest_header(manifest_header.read_text(encoding="utf-8")))
     engine_text = patch_engine(engine.read_text(encoding="utf-8"))
     engine_text = patch_empty_entries(engine_text)
     write_if_changed(engine, patch_close_slot(engine_text))
+    write_if_changed(header, patch_file_list_header(header.read_text(encoding="utf-8")))
+    write_if_changed(api, patch_file_list_api(api.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

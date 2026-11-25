@@ -81,6 +81,7 @@ private:
     mutable QRecursiveMutex m_catalogMutex;
     mutable QMutex m_cancelMutex;
     mutable QSet<QString> m_cancelledJobs;
+    mutable QSet<QString> m_cleanupJobs;
     mutable QMutex m_downloadCtrlMutex;
     mutable QHash<QString, depotkit_control*> m_downloadControls;
 };
