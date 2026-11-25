@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make the linked depotkit safe to call from steamidra on Windows.
+"""Patch the depotkit that steamidra links (sizing on Linux, safety on Windows).
 
 depotkit is compiled into steamidra_plugin.dll. Two bugs in that code become
 an invalid write inside the plugin image when an owns-download decrypts
@@ -123,6 +123,39 @@ def patch_manifest(text: str) -> str:
     return text.replace(MANIFEST_OLD, MANIFEST_NEW, 1)
 
 
+ENGINE_MARKER = "steamidra: size files to the manifest"
+ENGINE_OLD = """    if (fileSize > 0) {
+        slot.stream.seekp(static_cast<std::streamoff>(fileSize > 0 ? fileSize - 1 : 0));
+        char zero = 0;
+        slot.stream.write(&zero, 1);
+        slot.stream.flush();
+    }
+#endif"""
+ENGINE_NEW = """    // steamidra: size files to the manifest. Writing one byte at size-1 only ever
+    // grows a file; one that shrank between builds kept its old tail, and the verify
+    // could never fix it (wrong size -> re-download chunks -> still too long).
+    // Enshrouded: enshrouded_000.dat 1'511'514'112 bytes, expected 1'060'708'352.
+    // Unreal paks keep their index at the end, so Far Far West read empty files.
+    // The Windows branch already truncates with SetEndOfFile.
+    {
+        std::error_code resizeEc;
+        std::filesystem::resize_file(path, fileSize, resizeEc);
+        if (resizeEc) {
+            err = "cannot size " + path + ": " + resizeEc.message();
+            return false;
+        }
+    }
+#endif"""
+
+
+def patch_engine(text: str) -> str:
+    if ENGINE_MARKER in text:
+        return text
+    if ENGINE_OLD not in text:
+        raise SystemExit("engine.cpp: openFileSlot sizing pattern missing")
+    return text.replace(ENGINE_OLD, ENGINE_NEW, 1)
+
+
 def write_if_changed(path: Path, text: str) -> None:
     if path.read_text(encoding="utf-8") != text:
         path.write_text(text, encoding="utf-8")
@@ -135,12 +168,14 @@ def main() -> None:
     crypto = root / "src" / "crypto" / "depot_crypto.cpp"
     session = root / "src" / "steam" / "session.cpp"
     manifest = root / "src" / "manifest" / "manifest.cpp"
-    for p in (crypto, session, manifest):
+    engine = root / "src" / "engine" / "engine.cpp"
+    for p in (crypto, session, manifest, engine):
         if not p.is_file():
             raise SystemExit(f"missing {p}")
     write_if_changed(crypto, patch_crypto(crypto.read_text(encoding="utf-8")))
     write_if_changed(session, patch_session(session.read_text(encoding="utf-8")))
     write_if_changed(manifest, patch_manifest(manifest.read_text(encoding="utf-8")))
+    write_if_changed(engine, patch_engine(engine.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":
