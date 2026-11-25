@@ -156,6 +156,156 @@ def patch_engine(text: str) -> str:
     return text.replace(ENGINE_OLD, ENGINE_NEW, 1)
 
 
+EMPTY_ENTRIES_MARKER = "steamidra: materialize empty manifest entries"
+EMPTY_ENTRIES_OLD = r"""                if (f.flags & kFileFlagDirectory)
+                    continue;
+                ++totalFiles;
+                seenBytes += f.size;
+                std::string path = std::string(req->install_dir);
+#if defined(_WIN32)
+                if (!path.empty() && path.back() != '\\' && path.back() != '/')
+                    path.push_back('\\');
+#else
+                if (!path.empty() && path.back() != '/')
+                    path.push_back('/');
+#endif
+                path += f.filename;"""
+EMPTY_ENTRIES_NEW = r"""                std::string path = std::string(req->install_dir);
+#if defined(_WIN32)
+                if (!path.empty() && path.back() != '\\' && path.back() != '/')
+                    path.push_back('\\');
+#else
+                if (!path.empty() && path.back() != '/')
+                    path.push_back('/');
+#endif
+                path += f.filename;""" + f"""
+                // {EMPTY_ENTRIES_MARKER}
+                if (f.flags & kFileFlagDirectory) {{
+                    std::error_code ec;
+                    std::filesystem::create_directories(std::filesystem::path(path), ec);
+                    continue;
+                }}
+                ++totalFiles;
+                seenBytes += f.size;
+#if !defined(_WIN32)
+                if (f.size == 0) {{
+                    std::error_code ec;
+                    const auto size = std::filesystem::file_size(path, ec);
+                    if (size != 0 || ec) {{
+                        bool ready = false;
+                        if (!ec) {{
+                            std::filesystem::resize_file(path, 0, ec);
+                            ready = !ec;
+                        }} else if (ec == std::errc::no_such_file_or_directory && ensureParentDir(path)) {{
+                            std::ofstream emptyFile(path, std::ios::binary | std::ios::trunc);
+                            emptyFile.close();
+                            ready = static_cast<bool>(emptyFile);
+                        }}
+                        if (!ready) {{
+                            const std::string detail = "cannot create or truncate " + path;
+                            emit(onProgress, user,
+                                 depotkit_progress{{completeBytes, seenBytes, 0, filesDone, totalFiles,
+                                                   static_cast<uint32_t>(di),
+                                                   static_cast<uint32_t>(req->depot_count),
+                                                   DEPOTKIT_PHASE_ERROR, detail.c_str()}});
+                            return DEPOTKIT_ERR_IO;
+                        }}
+                    }}
+                    ++filesDone;
+                    continue;
+                }}
+#endif"""
+
+
+def patch_empty_entries(text: str) -> str:
+    if EMPTY_ENTRIES_MARKER in text:
+        return text
+    if EMPTY_ENTRIES_OLD not in text:
+        raise SystemExit("engine.cpp: manifest planning path pattern missing")
+    return text.replace(EMPTY_ENTRIES_OLD, EMPTY_ENTRIES_NEW, 1)
+
+
+CLOSE_SLOT_MARKER = "steamidra: check buffered writes at close"
+CLOSE_SLOT_OLD = """void closeFileSlot(FileSlot &slot)
+{
+#if defined(_WIN32)
+    if (slot.handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(slot.handle);
+        slot.handle = INVALID_HANDLE_VALUE;
+    }
+#else
+    if (slot.stream.is_open())
+        slot.stream.close();
+#endif
+    slot.ready.store(false);
+}"""
+CLOSE_SLOT_NEW = f"""bool closeFileSlot(FileSlot &slot)
+{{
+    bool ok = true;
+#if defined(_WIN32)
+    if (slot.handle != INVALID_HANDLE_VALUE) {{
+        CloseHandle(slot.handle);
+        slot.handle = INVALID_HANDLE_VALUE;
+    }}
+#else
+    // {CLOSE_SLOT_MARKER}
+    if (slot.stream.is_open()) {{
+        slot.stream.flush();
+        ok = static_cast<bool>(slot.stream);
+        slot.stream.close();
+        ok = ok && static_cast<bool>(slot.stream);
+    }}
+#endif
+    slot.ready.store(false);
+    return ok;
+}}"""
+
+FINALIZE_SLOTS_OLD = """    {
+        std::lock_guard lock(filesMu);
+        for (auto &kv : fileSlots)
+            closeFileSlot(*kv.second);
+        fileSlots.clear();
+    }"""
+FINALIZE_SLOTS_NEW = """    bool closeFailed = false;
+    {
+        std::lock_guard lock(filesMu);
+        for (auto &kv : fileSlots) {
+            if (!closeFileSlot(*kv.second) && !failed.load() && !closeFailed) {
+                closeFailed = true;
+                failMsg = "cannot flush or close " + kv.first;
+            }
+        }
+        fileSlots.clear();
+    }"""
+
+FINALIZE_RESULT_OLD = """    if (failed.load()) {
+        emit(onProgress, user,
+             depotkit_progress{bytesDone.load(), totalBytes, rate, filesDoneAtomic.load(), totalFiles, 0,
+                               static_cast<uint32_t>(req->depot_count), DEPOTKIT_PHASE_ERROR,
+                               failMsg.c_str()});
+        return DEPOTKIT_ERR_NETWORK;
+    }"""
+FINALIZE_RESULT_NEW = FINALIZE_RESULT_OLD.replace(
+    "if (failed.load())", "if (failed.load() || closeFailed)"
+).replace(
+    "return DEPOTKIT_ERR_NETWORK;", "return closeFailed ? DEPOTKIT_ERR_IO : DEPOTKIT_ERR_NETWORK;"
+)
+
+
+def patch_close_slot(text: str) -> str:
+    if CLOSE_SLOT_MARKER in text:
+        return text
+    if CLOSE_SLOT_OLD not in text:
+        raise SystemExit("engine.cpp: closeFileSlot pattern missing")
+    if FINALIZE_SLOTS_OLD not in text:
+        raise SystemExit("engine.cpp: file slot cleanup pattern missing")
+    if FINALIZE_RESULT_OLD not in text:
+        raise SystemExit("engine.cpp: download error result pattern missing")
+    text = text.replace(CLOSE_SLOT_OLD, CLOSE_SLOT_NEW, 1)
+    text = text.replace(FINALIZE_SLOTS_OLD, FINALIZE_SLOTS_NEW, 1)
+    return text.replace(FINALIZE_RESULT_OLD, FINALIZE_RESULT_NEW, 1)
+
+
 def write_if_changed(path: Path, text: str) -> None:
     if path.read_text(encoding="utf-8") != text:
         path.write_text(text, encoding="utf-8")
@@ -175,7 +325,9 @@ def main() -> None:
     write_if_changed(crypto, patch_crypto(crypto.read_text(encoding="utf-8")))
     write_if_changed(session, patch_session(session.read_text(encoding="utf-8")))
     write_if_changed(manifest, patch_manifest(manifest.read_text(encoding="utf-8")))
-    write_if_changed(engine, patch_engine(engine.read_text(encoding="utf-8")))
+    engine_text = patch_engine(engine.read_text(encoding="utf-8"))
+    engine_text = patch_empty_entries(engine_text)
+    write_if_changed(engine, patch_close_slot(engine_text))
 
 
 if __name__ == "__main__":
