@@ -27,6 +27,7 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
+#include <algorithm>
 #include <climits>
 #include <limits>
 #include <stdexcept>
@@ -514,9 +515,16 @@ void collectManifestFile(const char* name, uint64_t size, const uint8_t* sha1, u
                          void* user)
 {
     auto& entries = *static_cast<ManifestFiles*>(user);
-    const QString path = QString::fromUtf8(name);
+    QString path = QString::fromUtf8(name);
     const bool dir = flags & DEPOTKIT_FILE_DIRECTORY;
-    if (!isInventoryPath(path) || path.toUtf8() != name
+    const bool roundTrips = path.toUtf8() == name;
+#if defined(Q_OS_WIN)
+    // depotkit hands decrypted names back with '\' on Windows, where both are separators
+    // and runDownload() writes the same file either way. Rejecting them dropped the
+    // inventory for every depot on Windows ("unreadable file list for depot").
+    path.replace(QLatin1Char('\\'), QLatin1Char('/'));
+#endif
+    if (!isInventoryPath(path) || !roundTrips
         || (!dir && (!sha1 || size > uint64_t(std::numeric_limits<qint64>::max())))) {
         entries.valid = false;
         return;
@@ -768,10 +776,47 @@ QJsonObject runDepotkit(const QString& appid, const LuaParsed& parsed, const QSt
             {QStringLiteral("manifestId"), QString::number(static_cast<qulonglong>(manifestId))},
             {QStringLiteral("files"), entries.files}});
     }
-    return {{QStringLiteral("version"), 1},
-            {QStringLiteral("appId"), appid},
-            {QStringLiteral("os"), wantOsName},
-            {QStringLiteral("depots"), inventoryDepots}};
+
+    // What the depots Steam marks for another OS ship. Before the oslist check above,
+    // those depots were installed over the Windows build (Core Keeper's 1621692,
+    // Valheim's 892971/892973), and nothing tracked their files, so a verify never
+    // removed them and Sprout kept flagging the install as holding another platform's
+    // files. reconcileInventory() removes the ones the selected depots do not ship.
+    QJsonArray otherOsFiles;
+    for (const Cand& c : cands) {
+        if (!steamSaysOtherOs(c.depotId) || matchedIds.contains(c.depotId))
+            continue;
+        bool idOk = false;
+        const qulonglong depotNum = c.depotId.toULongLong(&idOk);
+        const QByteArray manifestPath = QDir::toNativeSeparators(c.manifestPath).toUtf8();
+        const QByteArray key = c.key.toUtf8();
+        if (!idOk || depotNum == 0 || depotNum > 0xffffffffu || manifestPath.isEmpty()
+            || key.size() != 64)
+            continue;
+        ManifestFiles entries;
+        uint64_t manifestId = 0;
+        uint32_t manifestDepotId = 0;
+        const depotkit_result listResult =
+            depotkit_manifest_list_files(manifestPath.constData(), key.constData(),
+                                         collectManifestFile, &entries, &manifestId,
+                                         &manifestDepotId);
+        if (listResult != DEPOTKIT_OK || !entries.valid || !manifestId
+            || manifestDepotId != depotNum) {
+            qWarning().noquote() << "[steamidra] cannot list other-OS depot" << c.depotId;
+            continue;
+        }
+        for (const QJsonValue& entry : entries.files)
+            otherOsFiles.append(entry);
+    }
+
+    QJsonObject inventory{{QStringLiteral("version"), 1},
+                          {QStringLiteral("appId"), appid},
+                          {QStringLiteral("os"), wantOsName},
+                          {QStringLiteral("depots"), inventoryDepots}};
+    // Not part of the saved inventory: reconcileInventory() takes it out again.
+    if (!otherOsFiles.isEmpty())
+        inventory.insert(QStringLiteral("otherOsFiles"), otherOsFiles);
+    return inventory;
 }
 
 QString inventoryPathKey(const QString& path)
@@ -1008,10 +1053,144 @@ StalePathType staleFileStamp(const QDir& root, const QString& relativePath, Stal
     return StalePathType::Other;
 }
 
+/**
+ * Remove what another OS's depot left in this install: files at paths only that depot
+ * ships, then the directories it ships once they are empty (a macOS .app bundle).
+ *
+ * Unlike a stale file, the bytes are not checked against the manifest: the leftover is
+ * usually from an older build of that depot, and no file the selected depots ship (or
+ * that the user keeps under a protected path) is ever touched. Paths are compared
+ * case-folded on every host, so a case-insensitive Linux mount cannot lose a shipped
+ * file under another spelling.
+ */
+void removeOtherOsLeftovers(const QDir& root, const QJsonArray& otherOsFiles,
+                            const QJsonArray& depots, const std::function<bool()>& rootStillSafe,
+                            const std::function<void()>& checkCancelled)
+{
+    if (otherOsFiles.isEmpty())
+        return;
+    QSet<QString> shipped;
+    for (const QJsonValue& value : depots) {
+        for (const QJsonValue& entry : value.toObject().value(QStringLiteral("files")).toArray())
+            shipped.insert(entry.toObject().value(QStringLiteral("path")).toString().toCaseFolded());
+    }
+
+    QStringList files;
+    QStringList dirs;
+    QSet<QString> seen;
+    for (const QJsonValue& value : otherOsFiles) {
+        const QJsonObject entry = value.toObject();
+        const QString path = entry.value(QStringLiteral("path")).toString();
+        const QString key = path.toCaseFolded();
+        if (!isInventoryPath(path) || shipped.contains(key) || seen.contains(key)
+            || isProtectedInventoryPath(path))
+            continue;
+        seen.insert(key);
+        (entry.value(QStringLiteral("dir")).toBool() ? dirs : files).append(path);
+    }
+    if (files.isEmpty() && dirs.isEmpty())
+        return;
+
+    // A macOS .app bundle only the other OS ships is that OS's program, whole. Files an
+    // older build put in it are not in today's manifest (Valheim kept three DLLs), and
+    // Sprout flags any .app it finds, so empty the bundle rather than just today's files.
+    // Every file still goes through the checks below.
+    int bundleBudget = 50000;
+    for (const QString& dir : QStringList(dirs)) {
+        if (!dir.endsWith(QStringLiteral(".app"), Qt::CaseInsensitive))
+            continue;
+        StaleFileStamp stamp;
+        if (staleFileStamp(root, dir, stamp) != StalePathType::Directory)
+            continue;
+        QDirIterator it(root.filePath(dir), QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot
+                                                | QDir::Hidden | QDir::System | QDir::NoSymLinks,
+                        QDirIterator::Subdirectories);
+        while (bundleBudget > 0 && it.hasNext()) {
+            checkCancelled();
+            --bundleBudget;
+            const QString path = root.relativeFilePath(it.next());
+            const QString key = path.toCaseFolded();
+            if (!isInventoryPath(path) || shipped.contains(key) || seen.contains(key)
+                || isProtectedInventoryPath(path))
+                continue;
+            seen.insert(key);
+            (it.fileInfo().isDir() ? dirs : files).append(path);
+        }
+    }
+
+#if defined(Q_OS_WIN)
+    // A DOS short name or a junction can make another-OS path land on a shipped file.
+    bool missing = false;
+    QString resolvedRoot = QDir::fromNativeSeparators(resolvedWindowsPath(root.absolutePath(), missing));
+    if (resolvedRoot.isEmpty()) {
+        qWarning().noquote() << "[steamidra] cannot resolve install root for other-OS cleanup";
+        return;
+    }
+    if (!resolvedRoot.endsWith(QLatin1Char('/')))
+        resolvedRoot += QLatin1Char('/');
+    QSet<QString> shippedAliases;
+    for (const QJsonValue& value : depots) {
+        for (const QJsonValue& entry : value.toObject().value(QStringLiteral("files")).toArray()) {
+            checkCancelled();
+            const QString path = entry.toObject().value(QStringLiteral("path")).toString();
+            const QString resolved = resolvedWindowsPath(root.filePath(path), missing);
+            if (resolved.isEmpty() && !missing) {
+                qWarning().noquote() << "[steamidra] cannot check shipped path aliases" << path;
+                return;
+            }
+            if (!resolved.isEmpty())
+                shippedAliases.insert(resolved.toCaseFolded());
+        }
+    }
+#endif
+
+    for (const QString& path : files) {
+        checkCancelled();
+        if (!rootStillSafe())
+            return;
+        const QString absolutePath = root.filePath(path);
+        StaleFileStamp stamp;
+        // Regular files only, reached through real directories (no links on the way).
+        if (staleFileStamp(root, path, stamp) != StalePathType::Regular)
+            continue;
+#if defined(Q_OS_WIN)
+        const QString resolved = resolvedWindowsPath(absolutePath, missing);
+        const QString normalized = QDir::fromNativeSeparators(resolved);
+        if (resolved.isEmpty() || !normalized.startsWith(resolvedRoot, Qt::CaseInsensitive)
+            || shippedAliases.contains(resolved.toCaseFolded())
+            || isProtectedInventoryPath(normalized.mid(resolvedRoot.size())))
+            continue;
+#endif
+        QFile file(absolutePath);
+        if (file.remove())
+            qInfo().noquote() << "[steamidra] removed other-OS file" << absolutePath;
+        else
+            qWarning().noquote() << "[steamidra] cannot remove other-OS file" << absolutePath
+                                 << file.errorString();
+    }
+
+    // Deepest first, so a bundle's subdirectories empty out before the bundle itself.
+    std::sort(dirs.begin(), dirs.end(), [](const QString& a, const QString& b) {
+        return a.count(QLatin1Char('/')) > b.count(QLatin1Char('/'));
+    });
+    for (const QString& path : dirs) {
+        checkCancelled();
+        if (!rootStillSafe())
+            return;
+        StaleFileStamp stamp;
+        if (staleFileStamp(root, path, stamp) != StalePathType::Directory)
+            continue;
+        // rmdir only removes an empty directory: anything else in it stays.
+        if (root.rmdir(path))
+            qInfo().noquote() << "[steamidra] removed other-OS directory" << root.filePath(path);
+    }
+}
+
 void reconcileInventory(const QString& installPath, QJsonObject inventory,
                         const std::function<void()>& checkCancelled,
                         const std::function<bool()>& beginCleanup)
 {
+    const QJsonArray otherOsFiles = inventory.take(QStringLiteral("otherOsFiles")).toArray();
     const QFileInfo install(QDir::cleanPath(installPath));
     const QString canonicalRoot = install.canonicalFilePath();
     if (!install.isDir() || canonicalRoot.isEmpty() || isLinkOrReparsePoint(install)) {
@@ -1253,6 +1432,22 @@ void reconcileInventory(const QString& installPath, QJsonObject inventory,
         }
     }
 
+    removeOtherOsLeftovers(root, otherOsFiles, depots, rootStillSafe, checkCancelled);
+
+    // Leave out the files this plugin rewrites after the download (steam_appid.txt, the
+    // Online Fix / SteamFix files). Cleanup never touches them anyway, and Sprout checks
+    // the size of every listed file: a rewritten steam_appid.txt ("480\n", 4 bytes
+    // against Valheim's 7) showed "A game file has the wrong size" after every verify.
+    for (qsizetype i = 0; i < depots.size(); ++i) {
+        QJsonObject depot = depots.at(i).toObject();
+        QJsonArray kept;
+        for (const QJsonValue& entry : depot.value(QStringLiteral("files")).toArray()) {
+            if (!isProtectedInventoryPath(entry.toObject().value(QStringLiteral("path")).toString()))
+                kept.append(entry);
+        }
+        depot.insert(QStringLiteral("files"), kept);
+        depots[i] = depot;
+    }
     inventory.insert(QStringLiteral("depots"), depots);
     // Retry these hashes without treating their paths as part of any current manifest.
     if (!pending.isEmpty())
