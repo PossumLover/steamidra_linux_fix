@@ -1063,6 +1063,19 @@ StalePathType staleFileStamp(const QDir& root, const QString& relativePath, Stal
  * case-folded on every host, so a case-insensitive Linux mount cannot lose a shipped
  * file under another spelling.
  */
+/*
+ * True for a steam_appid.txt whose directories are not protected. The plugin writes
+ * that name only beside the Windows game's own files, so one inside another OS's .app
+ * bundle is that build's (Dimhaven kept two from an older install) and may go with it.
+ */
+bool isUnprotectedAppIdFile(const QString& path)
+{
+    const qsizetype slash = path.lastIndexOf(QLatin1Char('/'));
+    return slash > 0
+           && path.mid(slash + 1).compare(QStringLiteral("steam_appid.txt"), Qt::CaseInsensitive) == 0
+           && !isProtectedInventoryPath(path.left(slash));
+}
+
 void removeOtherOsLeftovers(const QDir& root, const QJsonArray& otherOsFiles,
                             const QJsonArray& depots, const std::function<bool()>& rootStillSafe,
                             const std::function<void()>& checkCancelled)
@@ -1096,6 +1109,7 @@ void removeOtherOsLeftovers(const QDir& root, const QJsonArray& otherOsFiles,
     // Sprout flags any .app it finds, so empty the bundle rather than just today's files.
     // Every file still goes through the checks below.
     int bundleBudget = 50000;
+    QSet<QString> bundleFiles;
     for (const QString& dir : QStringList(dirs)) {
         if (!dir.endsWith(QStringLiteral(".app"), Qt::CaseInsensitive))
             continue;
@@ -1110,11 +1124,15 @@ void removeOtherOsLeftovers(const QDir& root, const QJsonArray& otherOsFiles,
             --bundleBudget;
             const QString path = root.relativeFilePath(it.next());
             const QString key = path.toCaseFolded();
+            const bool isDir = it.fileInfo().isDir();
+            const bool appIdFile = !isDir && isUnprotectedAppIdFile(path);
             if (!isInventoryPath(path) || shipped.contains(key) || seen.contains(key)
-                || isProtectedInventoryPath(path))
+                || (isProtectedInventoryPath(path) && !appIdFile))
                 continue;
             seen.insert(key);
-            (it.fileInfo().isDir() ? dirs : files).append(path);
+            if (appIdFile)
+                bundleFiles.insert(key);
+            (isDir ? dirs : files).append(path);
         }
     }
 
@@ -1156,9 +1174,12 @@ void removeOtherOsLeftovers(const QDir& root, const QJsonArray& otherOsFiles,
 #if defined(Q_OS_WIN)
         const QString resolved = resolvedWindowsPath(absolutePath, missing);
         const QString normalized = QDir::fromNativeSeparators(resolved);
+        const QString resolvedPath = normalized.mid(resolvedRoot.size());
         if (resolved.isEmpty() || !normalized.startsWith(resolvedRoot, Qt::CaseInsensitive)
             || shippedAliases.contains(resolved.toCaseFolded())
-            || isProtectedInventoryPath(normalized.mid(resolvedRoot.size())))
+            || (isProtectedInventoryPath(resolvedPath)
+                && !(bundleFiles.contains(path.toCaseFolded())
+                     && isUnprotectedAppIdFile(resolvedPath))))
             continue;
 #endif
         QFile file(absolutePath);
